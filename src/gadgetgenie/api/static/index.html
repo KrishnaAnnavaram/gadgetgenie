@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GadgetGenie</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main>
+    <h1>GadgetGenie</h1>
+    <p class="sub">Ask for laptops, phones, tablets or smartwatches in plain English.</p>
+    <div id="log" aria-live="polite"></div>
+    <form id="ask">
+      <input id="question" maxlength="500" autocomplete="off" placeholder="e.g. cheapest 5G phones under $400" required>
+      <button type="submit">Ask</button>
+    </form>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

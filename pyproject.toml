@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gadgetgenie"
+version = "0.1.0"
+description = "Ask in plain English, get phone and laptop picks via guarded LLM text-to-SQL"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.10"
+dependencies = ["sqlglot>=30,<32", "httpx>=0.27"]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
+postgres = ["psycopg[binary]>=3.1"]
+mysql = ["pymysql>=1.1"]
+all = ["gadgetgenie[api,postgres,mysql]"]
+dev = ["pytest>=8", "ruff"]
+
+[project.scripts]
+gadgetgenie = "gadgetgenie.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gadgetgenie = ["prompts/*.md", "evaluation/*.jsonl", "api/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120

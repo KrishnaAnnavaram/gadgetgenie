@@ -1,0 +1,26 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# data: databases, source CSVs, logs and reports are never committed
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.jsonl
+!src/gadgetgenie/evaluation/gold.jsonl
+reports/
+logs/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
