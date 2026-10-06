@@ -4,15 +4,15 @@
 !.env.example
 
 # data: databases, source CSVs, logs and reports are never committed
-data/
+/data/
 *.db
 *.sqlite
 *.sqlite3
 *.csv
 *.jsonl
 !src/gadgetgenie/evaluation/gold.jsonl
-reports/
-logs/
+/reports/
+/logs/
 
 # python
 __pycache__/
