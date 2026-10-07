@@ -1,6 +1,6 @@
 <div align="center">
 
-# GadgetGenie — Guarded Text-to-SQL Device Recommendations
+# gadgetgenie — Guarded Text-to-SQL Device Recommendations
 
 **GadgetGenie is a device recommender for laptops, phones, tablets and smartwatches. It takes a plain-English question about devices through these steps to a short recommendation that the code checks against the result rows:**
 
