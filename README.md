@@ -68,6 +68,7 @@ This README is the **one location that explains all of GadgetGenie**. It gives t
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one question](#42-the-life-cycle-of-one-question)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The catalogue and the ETL step](#5-the-catalogue-and-the-etl-step)
 6. 🟢 [The input check and the session store](#6-the-input-check-and-the-session-store)
 7. 🟣 [The slot extractor](#7-the-slot-extractor)
@@ -143,6 +144,60 @@ flowchart LR
 | Front ends | `cli.py`, `api/app.py`, `api/static/` | CLI, FastAPI HTTP API and chat page |
 | Evaluation harness | `src/gadgetgenie/evaluation/` | Gold set, ground truth, metrics and report |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph FRONT["Front ends"]
+        CLI["cli.py<br/>seed, ask, eval, serve"]
+        API["api/app.py<br/>create_app"]
+    end
+    subgraph SERVICE["Recommender service"]
+        SVC["core/service.py<br/>build_recommender, Recommender.ask"]
+        MEM["core/memory.py<br/>Sessions"]
+        SLOT["core/slots.py<br/>extract, merge"]
+        LOG["core/logs.py<br/>QueryLog"]
+    end
+    subgraph SQLPATH["SQL path"]
+        T2S["core/text2sql.py<br/>TextToSQL.run"]
+        REP["core/replies.py<br/>parse_reply"]
+        GRD["core/sql_guard.py<br/>check_sql"]
+        EXE["core/executors.py<br/>SQLite, Postgres, MySQL"]
+    end
+    subgraph MODEL["LLM and prompts"]
+        LLM["core/llm.py, core/offline.py<br/>OpenAICompatibleModel, OfflineModel"]
+        PRM["core/prompts.py<br/>sql_v2.md, summary_v2.md"]
+    end
+    SUM["core/summarize.py<br/>Summarizer"]
+    EVA["evaluation/<br/>evaluate, load_gold"]
+    ETL["etl/<br/>loaders, synthetic, seed"]
+    CFG["config.py<br/>Settings"]
+    SCH["schema.py<br/>DDL, VIEWS"]
+
+    CLI --> SVC
+    CLI --> EVA
+    CLI --> ETL
+    CLI -- "serve" --> API
+    API --> SVC
+    EVA --> SVC
+    EVA --> GRD
+    SVC --> CFG
+    SVC --> SLOT
+    SVC --> MEM
+    SVC --> T2S
+    SVC --> SUM
+    SVC --> LOG
+    T2S --> LLM
+    T2S --> PRM
+    T2S --> REP
+    T2S --> GRD
+    T2S --> EXE
+    SUM --> LLM
+    SUM --> PRM
+    EXE --> SCH
+    ETL --> SCH
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -189,6 +244,18 @@ gadgetgenie/
 ### 3.1 The code enforces safety, not the prompt
 The prompt tells the LLM to treat the question as data. A prompt cannot stop prompt injection. Thus `sql_guard.check_sql()` parses each SQL query and rejects it if it breaks an allow-list. The executors then open each connection read-only, so a query that passes the SQL guard still cannot write.
 
+```mermaid
+flowchart LR
+    LLMSQL[/"SQL from the LLM"/] --> P["Layer 0: prompt<br/>advice only, no control"]
+    P --> G{"Layer 1: SQL guard<br/>check_sql"}
+    G -- "breaks an allow-list" --> R1[/"UnsafeSQL<br/>feedback to the LLM"/]
+    G -- "passes" --> E{"Layer 2: executor<br/>read-only connection"}
+    E -- "write or other object" --> R2[/"ExecutionError<br/>feedback to the LLM"/]
+    E -- "read" --> A{"Layer 3: database account<br/>SELECT on 2 views only"}
+    A -- "no grant" --> R2
+    A -- "granted" --> ROWS[/"Rows"/]
+```
+
 ### 3.2 The LLM sees views, not tables
 The LLM can query only the views `laptops` and `phones`. The base tables and the key `device_id` are not in the views. The SQL guard rejects all other table names, and the read-only accounts have grants on the views only.
 
@@ -211,32 +278,84 @@ The CLI, the HTTP API and the evaluation harness all call `build_recommender()`.
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    Q["Question (chat page, HTTP API or CLI)"] --> CL["Input check: NFKC, control characters, length limit"]
-    CL --> SL["Slot extractor: category, budget in USD, brands, requirements, sort order"]
-    SL -->|"no exchange rate"| NI["Status needs_input: ask for a USD budget"]
-    SL --> MEM["Session store: a follow-up gets the earlier slots"]
-    MEM --> GEN["LLM in JSON mode: sql or error, temperature 0, fixed seed"]
-    GEN --> PR["Reply parser: JSON decoder"]
-    PR -->|"error key"| REF["Status refused (no retry)"]
-    PR --> G["SQL guard: one SELECT, views, columns, functions, enum values, LIMIT"]
-    G --> X["Read-only executor: SQLite, PostgreSQL or MySQL, with time limit"]
-    PR -.->|"bad reply"| FB["Feedback: previous reply and error"]
-    G -.->|"rejected"| FB
-    X -.->|"database error"| FB
-    FB -->|"attempt < MAX_ATTEMPTS"| GEN
-    X --> SUM["Summarizer: all rows and the true row count"]
-    SUM --> FA["Faithfulness check: each number has a source"]
-    FA --> A["Answer: summary, rows, SQL, attempt count, notes"]
-    A --> LOG["Query log: status, attempts, time, tokens"]
+flowchart TD
+    Q[/"Question and optional session ID<br/>chat page, HTTP API or CLI"/] --> CL{"Input check<br/>NFKC, control characters, length limit"}
+    CL -- "empty or too long" --> INV[/"Status invalid"/]
+    CL -- "clean text" --> SL["Slot extractor: category, budget in USD,<br/>brands, requirements, sort order"]
+    MEM[("Session store<br/>last turn of each session")] -- "earlier slots for a follow-up" --> SL
+    SL --> RATE{"Budget currency<br/>has a rate?"}
+    RATE -- "no" --> NI[/"Status needs_input"/]
+    NI --> HUMAN{{"HUMAN<br/>user asks again with a USD budget"}}
+    RATE -- "yes" --> GEN["LLM in JSON mode: sql or error,<br/>temperature 0, fixed seed"]
+    GEN -- "transport error" --> ME[/"Status model_error"/]
+    GEN --> PR{"Reply parser<br/>parse_reply"}
+    PR -- "error key" --> REF[/"Status refused, no retry"/]
+    PR -- "sql key" --> G{"SQL guard: one SELECT, views, columns,<br/>functions, enum values, LIMIT"}
+    G -- "passes" --> X{"Read-only executor: SQLite,<br/>PostgreSQL or MySQL, with time limit"}
+    PR -. "bad reply" .-> FB["Feedback: previous reply and error"]
+    G -. "rejected" .-> FB
+    X -. "database error" .-> FB
+    FB -- "attempts left" --> GEN
+    FB -- "MAX_ATTEMPTS used" --> FAIL[/"Status failed"/]
+    X -- "rows" --> SUM["Summarizer: all rows and the true row count"]
+    SUM --> FA{"Faithfulness check:<br/>each number has a source?"}
+    FA -- "yes" --> A[/"Answer: LLM summary, rows, SQL,<br/>attempt count, notes"/]
+    FA -- "no" --> PLAIN[/"Answer: plain summary,<br/>faithful false"/]
+    A --> KEEP["Sessions.remember the turn,<br/>QueryLog.add one record"]
+    PLAIN --> KEEP
+    REF --> KEEP
+    FAIL --> KEEP
+    ME --> KEEP
+    KEEP --> MEM
+    KEEP --> LOG[("Query log: status, attempts, time, tokens")]
     subgraph data["Catalogue"]
-        ETL["ETL: header aliases, units, exchange rate, data source, NULL"] --> T["devices, laptop_specs, phone_specs"]
-        T --> V["Views laptops and phones (no device_id)"]
+        ETL["ETL: header aliases, units, exchange rate, data source, NULL"] --> T[("devices, laptop_specs, phone_specs")]
+        T --> V[("Views laptops and phones, no device_id")]
     end
     V --> X
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one question
+
+```mermaid
+stateDiagram-v2
+    state "Raw question" as Raw
+    state "Clean question" as Clean
+    state "Slots, merged with the earlier turn" as Slotted
+    state "Attempt n: reply from the LLM" as Attempt
+    state "Checked SQL" as Checked
+    state "Rows" as Rows
+    state "Summary checked" as Summarized
+    state "Kept and logged" as Kept
+    [*] --> Raw: front end calls Recommender.ask
+    Raw --> invalid: empty or too long
+    Raw --> Clean: clean
+    Clean --> Slotted: extract, merge
+    Slotted --> needs_input: budget currency has no rate
+    Slotted --> Attempt: TextToSQL.run
+    Attempt --> model_error: ModelError
+    Attempt --> refused: reply has an error key
+    Attempt --> Checked: parse_reply, check_sql
+    Attempt --> Attempt: bad reply, attempts left
+    Checked --> Attempt: UnsafeSQL or ExecutionError, attempts left
+    Checked --> Rows: executor.run
+    Attempt --> failed: MAX_ATTEMPTS used
+    Checked --> failed: MAX_ATTEMPTS used
+    Rows --> ok
+    ok --> Summarized: summarize, faithfulness check
+    Summarized --> Kept
+    refused --> Kept
+    failed --> Kept
+    model_error --> Kept
+    Kept --> [*]
+    invalid --> [*]
+    needs_input --> [*]
+```
+
+The status names `invalid`, `needs_input`, `refused`, `failed`, `model_error` and `ok` are the values of `Answer.status`.
 
 1. A front end sends the question and an optional session ID to `Recommender.ask()`.
 2. If the session ID is not 32 lower-case hexadecimal characters, the service makes a new random ID.
@@ -250,11 +369,73 @@ flowchart TB
 10. The service keeps the turn in the session store and adds one record to the query log.
 11. The front end shows the summary, the notes, the rows and the SQL with the attempt count.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant PAGE as Chat page app.js
+    participant API as HTTP API api/app.py
+    participant REC as Recommender
+    participant T2S as TextToSQL
+    participant LLM as LLM client
+    participant GRD as SQL guard
+    participant DB as Read-only executor
+    participant SUM as Summarizer
+
+    U->>PAGE: type a question
+    PAGE->>API: POST /api/ask with question and session_id
+    API->>API: guard: bearer token, rate limit
+    API->>REC: ask(question, session_id)
+    REC->>REC: clean, extract slots, merge with the last turn
+    REC->>T2S: run(question, slots, previous question)
+    loop a maximum of MAX_ATTEMPTS attempts
+        T2S->>LLM: chat(system, user, json_mode=True)
+        LLM-->>T2S: reply text and tokens
+        T2S->>T2S: parse_reply
+        T2S->>GRD: check_sql(sql, policy)
+        GRD-->>T2S: CheckedSQL with LIMIT
+        T2S->>DB: run(checked sql, MAX_ROWS)
+        DB-->>T2S: Rows or ExecutionError
+    end
+    T2S-->>REC: SQLOutcome with status ok
+    REC->>SUM: summarize(question, rows)
+    SUM->>LLM: chat(summary prompt, question and all rows)
+    LLM-->>SUM: summary text
+    SUM->>SUM: unsupported_numbers
+    SUM-->>REC: Summary, faithful or plain
+    REC->>REC: Sessions.remember, QueryLog.add
+    REC-->>API: Answer
+    API-->>PAGE: JSON answer
+    PAGE-->>U: summary, notes, rows table, SQL
+```
+
 ---
 
 ## 5. The catalogue and the ETL step
 
 **Purpose.** Keep one typed catalogue with explicit units, a data source and a price date for each device.
+
+```mermaid
+flowchart TD
+    CMD[/"gadgetgenie seed<br/>Settings.from_env"/] --> CSVQ{"--laptops-csv or<br/>--phones-csv given?"}
+    CSVQ -- "no" --> GEN["synthetic.generate<br/>seed 11, 140 fictional devices"]
+    CSVQ -- "yes" --> SRCQ{"--source given?"}
+    SRCQ -- "no" --> STOP1[/"Command stops"/]
+    SRCQ -- "yes" --> MAP{"map_headers:<br/>brand and model found?"}
+    MAP -- "no" --> ERR1[/"SchemaMismatchError"/]
+    MAP -- "yes" --> ROW["For each row: unit parsers,<br/>unparseable value to NULL and counted"]
+    ROW --> CUR{"Currency USD,<br/>or --rate-to-usd given?"}
+    CUR -- "no" --> ERR2[/"ValueError: rate needed"/]
+    CUR -- "yes" --> REC["Record with price_usd,<br/>price_as_of and source"]
+    GEN --> DEST{"--postgres OWNER_DSN?"}
+    REC --> DEST
+    DEST -- "no" --> SQ["write_sqlite: delete the old file,<br/>apply the DDL, insert"]
+    DEST -- "yes" --> PG["write_postgres: apply the DDL,<br/>insert as the owner role"]
+    SQ --> DB1[("data/gadgetgenie.db")]
+    PG --> DB2[("PostgreSQL tables and views")]
+```
 
 | Input | Output |
 |---|---|
@@ -271,6 +452,46 @@ flowchart TB
 | `phones` | View, 18 columns | Phones, tablets and smartwatches with their specs and `category`. No `device_id` |
 
 Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 values), `gpu_brand` (5 values) and `wifi_standard` (`Wi-Fi 5`, `Wi-Fi 6`, `Wi-Fi 6E`, `Wi-Fi 7`).
+
+```mermaid
+erDiagram
+    devices ||--o| laptop_specs : "laptop specs"
+    devices ||--o| phone_specs : "phone, tablet or smartwatch specs"
+    devices {
+        INTEGER device_id PK
+        TEXT category "phone, tablet, smartwatch, laptop"
+        TEXT brand
+        TEXT model UK
+        INTEGER release_year
+        REAL price_usd "NULL or above 0"
+        DATE price_as_of
+        REAL rating "NULL or 0 to 5"
+        TEXT source
+    }
+    laptop_specs {
+        INTEGER device_id PK, FK
+        TEXT cpu_brand
+        INTEGER ram_gb
+        INTEGER ssd_gb
+        TEXT gpu_brand
+        SMALLINT dedicated_gpu
+        REAL weight_kg
+        REAL battery_hours
+        TEXT wifi_standard
+    }
+    phone_specs {
+        INTEGER device_id PK, FK
+        TEXT chipset
+        INTEGER ram_gb
+        INTEGER storage_gb
+        INTEGER battery_mah
+        SMALLINT supports_5g
+        SMALLINT nfc
+        REAL weight_g
+    }
+```
+
+The diagram shows the keys and the main spec columns. The views `laptops` and `phones` join each spec table to `devices` and leave out `device_id`.
 
 **Procedure**
 
@@ -307,6 +528,17 @@ Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 value
 
 **Purpose.** Reject bad input before it reaches the LLM, and keep the last turn of each session.
 
+```mermaid
+flowchart LR
+    IN[/"Raw question text"/] --> N["unicodedata NFKC"]
+    N --> C["Control characters to spaces,<br/>strip outer spaces"]
+    C --> E{"Empty, or more than<br/>MAX_QUESTION_CHARS?"}
+    E -- "yes" --> INV[/"Answer with status invalid"/]
+    E -- "no" --> OK[/"Clean question"/]
+    OK --> TAG["prompts.tag: wrap in question tags,<br/>change a tag-like less-than sign to ‹"]
+    TAG --> MSG[/"Text for the LLM message"/]
+```
+
 | Input | Output |
 |---|---|
 | Raw question text, optional session ID | Clean question text and a valid session ID, or an answer with status `invalid` |
@@ -321,6 +553,20 @@ Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 value
 
 **Session rules** (`core/memory.py`)
 
+```mermaid
+flowchart LR
+    SID[/"Session ID from the client"/] --> V{"valid_session_id:<br/>32 lower-case hex characters?"}
+    V -- "no" --> NEW["new_session_id:<br/>secrets.token_hex 16"]
+    V -- "yes" --> LAST["Sessions.last:<br/>earlier turn or none"]
+    NEW --> LAST
+    LAST --> ASK["Recommender.ask"]
+    ASK --> REM["Sessions.remember:<br/>question, slots, answer"]
+    REM --> CAP{"More than<br/>2,000 sessions?"}
+    CAP -- "yes" --> EVICT["Remove the least<br/>recently used session"]
+    CAP -- "no" --> STORE[("OrderedDict in process memory")]
+    EVICT --> STORE
+```
+
 - A session ID is `secrets.token_hex(16)`: 32 lower-case hexadecimal characters. The server makes it.
 - The service replaces a client session ID that does not have this format.
 - `Sessions` keeps only the last turn (question, slots, answer) of each session.
@@ -332,6 +578,27 @@ Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 value
 ## 7. The slot extractor
 
 **Purpose.** Change the question into explicit slots, and give them to the LLM as hints. Convert each budget to US dollars with a configured exchange rate.
+
+```mermaid
+flowchart TD
+    Q[/"Clean question"/] --> CAT["Category words, brands from the catalogue,<br/>intent, sort order, requirements"]
+    Q --> PM["_price_mentions: between X and Y,<br/>or a budget word and an amount"]
+    PM --> U{"Unit after the amount?<br/>GB, kg, hours, mAh, inch, MP, GHz, stars"}
+    U -- "yes" --> SKIP["Not a price, skip"]
+    U -- "no" --> AMT["_amount: number, k means 1,000,<br/>currency from sign or word"]
+    AMT --> SMALL{"No currency and<br/>less than 50?"}
+    SMALL -- "yes" --> SKIP
+    SMALL -- "no" --> FX{"Rate in<br/>FX_RATES_TO_USD?"}
+    FX -- "no" --> PROB["Add a problem<br/>MissingRateError text"]
+    FX -- "yes" --> USD["to_usd: max_price_usd or min_price_usd,<br/>budget note if not USD"]
+    CAT --> SL[/"Slots and hints text"/]
+    USD --> SL
+    PROB --> SL
+    SL --> MG["merge with the earlier slots"]
+    MG --> P{"Slots have problems?"}
+    P -- "yes" --> NI[/"Service returns needs_input"/]
+    P -- "no" --> T2S[/"Hints go to the text-to-SQL loop"/]
+```
 
 | Input | Output |
 |---|---|
@@ -360,6 +627,17 @@ Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 value
 
 **Follow-up rules** (`merge()`)
 
+```mermaid
+flowchart LR
+    IN[/"Earlier slots, new slots,<br/>new question"/] --> A{"Earlier turn with a category,<br/>and no category in the new slots?"}
+    A -- "no" --> NEWS[/"New slots without change"/]
+    A -- "yes" --> B{"Off-topic, and no<br/>follow-up start word?"}
+    B -- "yes" --> NEWS
+    B -- "no" --> INH["Copy each empty slot from the earlier turn:<br/>category, budget, brands, limits"]
+    INH --> FL["Requirement flags: earlier OR new<br/>5G, NFC, dedicated GPU, fingerprint"]
+    FL --> OUT[/"Merged slots, off_topic false"/]
+```
+
 - A follow-up gets the earlier category, budget, brands and limits that the new question does not give.
 - The requirement flags (5G, NFC, dedicated GPU, fingerprint) of the two turns add together.
 - An off-topic question that does not start like a follow-up ("and", "what about", "cheaper", "only", …) gets no earlier slots.
@@ -369,6 +647,26 @@ Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 value
 ## 8. The text-to-SQL loop
 
 **Purpose.** Get one valid SQL query from the LLM and run it read-only, with a fixed number of attempts.
+
+```mermaid
+flowchart TD
+    IN[/"Question, slots,<br/>earlier question"/] --> SYS["System prompt: sql_v2.md with dialect,<br/>schema_doc and MAX_ROWS"]
+    SYS --> MSG["User message: question, hints, previous_question,<br/>and previous_reply and error after a failure"]
+    MSG --> CALL["model.chat, json_mode true"]
+    CALL -- "ModelError" --> ME[/"Status model_error"/]
+    CALL --> LOGA["AttemptLog n: raw reply,<br/>add the tokens"]
+    LOGA --> PARSE{"parse_reply: remove think blocks<br/>and code fences, decode JSON"}
+    PARSE -- "error key" --> REF[/"Status refused"/]
+    PARSE -- "BadReply" --> ERR["Record the error<br/>in the attempt"]
+    PARSE -- "sql key" --> CHK{"check_sql"}
+    CHK -- "UnsafeSQL" --> ERR
+    CHK -- "CheckedSQL" --> RUN{"executor.run"}
+    RUN -- "ExecutionError" --> ERR
+    RUN -- "Rows" --> OK[/"Status ok: SQL, rows,<br/>attempts, tokens, time"/]
+    ERR --> MORE{"Attempts left?<br/>MAX_ATTEMPTS"}
+    MORE -- "yes" --> MSG
+    MORE -- "no" --> FAIL[/"Status failed:<br/>no valid query after N attempts"/]
+```
 
 | Input | Output |
 |---|---|
@@ -392,11 +690,43 @@ Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 value
 - The offline LLM makes SQL from the slots and the hints. It refuses a question without a category.
 - The prompt asks the LLM to put `NULL` values last when it sorts.
 
+**The LLM client** (`core/llm.py`). `OpenAICompatibleModel.chat()` makes one LLM call with a fixed number of HTTP requests:
+
+```mermaid
+flowchart LR
+    IN[/"system, user, json_mode"/] --> BODY["Body: model, temperature 0, LLM_SEED,<br/>response_format json_object if json_mode"]
+    BODY --> POST["POST base URL /chat/completions"]
+    POST --> S{"Response"}
+    S -- "200" --> OUT[/"Completion: text,<br/>prompt and completion tokens"/]
+    S -- "200, bad JSON" --> ME[/"ModelError"/]
+    S -- "other status, not transient" --> ME
+    S -- "transport error, or<br/>408, 429, 500, 502, 503, 504" --> R{"Retries left?<br/>2 retries"}
+    R -- "yes" --> W["Wait 1.5 s, then 3 s"]
+    W --> POST
+    R -- "no" --> ME
+```
+
 ---
 
 ## 9. The read-only executors
 
 **Purpose.** Run one checked SQL query on a read-only connection with a row limit and a time limit.
+
+```mermaid
+flowchart LR
+    IN[/"Checked SQL, MAX_ROWS"/] --> B{"DB_BACKEND"}
+    B -- "sqlite" --> S1["Open file URI mode=ro,<br/>PRAGMA query_only = 1"]
+    S1 --> S2["set_authorizer: SELECT, READ of the<br/>3 base tables and 2 views, functions"]
+    S2 --> S3["Progress handler stops the query<br/>after QUERY_TIMEOUT_S"]
+    B -- "postgres" --> P1["read_only = True,<br/>SET LOCAL statement_timeout,<br/>rollback after the query"]
+    B -- "mysql" --> M1["SET SESSION TRANSACTION READ ONLY,<br/>MAX_EXECUTION_TIME, START TRANSACTION READ ONLY,<br/>rollback after the query"]
+    S3 --> F["execute, fetchmany MAX_ROWS + 1"]
+    P1 --> F
+    M1 --> F
+    F --> E{"Database error?"}
+    E -- "yes" --> ERR[/"ExecutionError,<br/>feedback to the loop"/]
+    E -- "no" --> OUT[/"Rows: columns, first MAX_ROWS rows,<br/>truncated if one more row exists"/]
+```
 
 | Input | Output |
 |---|---|
@@ -420,6 +750,19 @@ Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 value
 ## 10. The summarizer and the faithfulness check
 
 **Purpose.** Make a short recommendation from the result rows, and make sure that it does not invent numbers.
+
+```mermaid
+flowchart TD
+    IN[/"Clean question, Rows"/] --> SYS["System prompt: summary_v2.md,<br/>true row count, more rows exist if truncated"]
+    SYS --> CALL["model.chat: question and<br/>all rows as JSON in rows tags"]
+    CALL --> T{"ModelError or<br/>empty text?"}
+    T -- "yes" --> PL1[/"Plain summary, faithful true"/]
+    T -- "no" --> ALW["allowed_numbers: 0 to row count,<br/>row values, numbers in text cells and the question"]
+    ALW --> SAFE["Remove safe tokens:<br/>5G, Wi-Fi 6E, USB-C 3.2, 3rd"]
+    SAFE --> CHK{"Each number in the summary<br/>matches an allowed variant?"}
+    CHK -- "yes" --> LLMS[/"LLM summary, faithful true"/]
+    CHK -- "no" --> PL2[/"Plain summary, faithful false,<br/>unsupported numbers listed"/]
+```
 
 | Input | Output |
 |---|---|
@@ -449,6 +792,35 @@ Enum columns: `category` (`phone`, `tablet`, `smartwatch`), `cpu_brand` (4 value
 ## 11. The front ends
 
 **Purpose.** Give the same recommender to a terminal user, an HTTP client and a browser user.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as HTTP client or chat page
+    participant MW as Security headers middleware
+    participant G as guard dependency
+    participant H as ask handler
+    participant R as Recommender
+
+    C->>MW: POST /api/ask, JSON body
+    MW->>G: request
+    alt API_TOKEN set and the bearer token is wrong
+        G-->>C: 401
+    else more than RATE_LIMIT_PER_MINUTE requests in 60 s
+        G-->>C: 429
+    end
+    G->>H: AskBody: question 1 to MAX_QUESTION_CHARS, session_id up to 64
+    alt body not valid
+        H-->>C: 422
+    else content type not application/json
+        H-->>C: 415
+    end
+    H->>H: keep session_id only if it is valid
+    H->>R: ask(question, session_id)
+    R-->>H: Answer
+    H-->>MW: JSONResponse with the answer fields
+    MW-->>C: answer with CSP, nosniff and no-referrer headers
+```
 
 **CLI commands** (`gadgetgenie`, from `cli.py`)
 
@@ -507,6 +879,18 @@ The `POST /api/ask` body is `{"question": "...", "session_id": "..."}`. The `ses
 
 **Purpose.** Keep one record for each question with the real attempt count, the status and the time.
 
+```mermaid
+flowchart LR
+    A[/"Question, SQLOutcome,<br/>summary result"/] --> S{"Status invalid<br/>or needs_input?"}
+    S -- "yes" --> NO[/"No record"/]
+    S -- "no" --> REC["LogRecord: question, status, sql, attempts,<br/>solved_at, faithful, seconds, tokens, errors, ts"]
+    REC --> BUF[("Memory buffer<br/>last 1,000 records")]
+    REC --> P{"QUERY_LOG_PATH set?"}
+    P -- "yes" --> FILE[("JSONL file<br/>one line for each record")]
+    BUF --> ST["QueryLog.stats"]
+    ST --> OUT[/"GET /api/stats: questions, by_status,<br/>solved_at_attempt, retry_rate, unfaithful_answers"/]
+```
+
 | Input | Output |
 |---|---|
 | The question, the `SQLOutcome` and the summary result | `LogRecord` in memory, and one JSON line in `QUERY_LOG_PATH` if set |
@@ -523,6 +907,28 @@ The `POST /api/ask` body is `{"question": "...", "session_id": "..."}`. The `ses
 ## 13. The evaluation harness
 
 **Purpose.** Measure the end-to-end accuracy, the attempts, the refusals, the faithfulness and the time on a gold set. The ground truth comes from the data.
+
+```mermaid
+flowchart TD
+    GOLD[/"gold.jsonl or --gold PATH"/] --> LOAD{"load_gold: unique IDs, known compare mode,<br/>gold_sql or expect_refusal?"}
+    LOAD -- "no" --> GE[/"GoldError"/]
+    LOAD -- "yes" --> VAL{"validate_gold: each gold SQL<br/>passes check_sql?"}
+    VAL -- "no" --> GE
+    VAL -- "yes" --> ASK["For each item: Recommender.ask<br/>with a new session"]
+    ASK --> K{"expect_refusal?"}
+    K -- "yes" --> RF["Correct if status is refused"]
+    K -- "no" --> ST{"Status ok?"}
+    ST -- "no" --> WR["Not correct"]
+    ST -- "yes" --> GR["Run the gold SQL through<br/>check_sql and the executor"]
+    GR --> CM{"compare"}
+    CM -- "scalar" --> SC["Correct if the gold value is<br/>in the single predicted row"]
+    CM -- "set" --> SE["Correct if the model sets are equal,<br/>Jaccard index"]
+    RF --> SUMM["summarize: accuracy, set match,<br/>accuracy within k attempts, retry rate,<br/>refusals, faithfulness, latency, tokens"]
+    WR --> SUMM
+    SC --> SUMM
+    SE --> SUMM
+    SUMM --> OUT[/"format_report on screen,<br/>JSON report with --out"/]
+```
 
 | Input | Output |
 |---|---|
@@ -558,6 +964,27 @@ The `POST /api/ask` body is `{"question": "...", "session_id": "..."}`. The `ses
 ## 14. The query safety model
 
 The code enforces each rule in this section. Prompt injection can change which allowed read-only query runs, but it cannot widen what the query can read.
+
+```mermaid
+flowchart TD
+    IN[/"SQL text from the LLM"/] --> C1{"1. Not empty, 3,000 characters or less,<br/>parses in SQL_DIALECT, one statement?"}
+    C1 -- "yes" --> C2{"2. SELECT or set operation,<br/>no banned node, no recursive CTE?"}
+    C2 -- "yes" --> C3{"3. Tables: laptops, phones or a CTE,<br/>no qualified name, no table function?"}
+    C3 -- "yes" --> C4{"4. Each column in an allowed view<br/>or an alias, star only in COUNT?"}
+    C4 -- "yes" --> C5{"5. Each function in SAFE_FUNCTIONS?"}
+    C5 -- "yes" --> C6{"6. Enum literals are valid values?"}
+    C6 -- "yes" --> C7{"7. LIMIT is an integer of at least 1?"}
+    C7 -- "yes" --> LIM["Add LIMIT, or reduce it to MAX_ROWS"]
+    LIM --> GEN["Generate the SQL again from the tree,<br/>executor dialect, no comments"]
+    GEN --> OUT[/"CheckedSQL: sql, views, limit"/]
+    C1 -- "no" --> REJ[/"UnsafeSQL with a message<br/>that the LLM can act on"/]
+    C2 -- "no" --> REJ
+    C3 -- "no" --> REJ
+    C4 -- "no" --> REJ
+    C5 -- "no" --> REJ
+    C6 -- "no" --> REJ
+    C7 -- "no" --> REJ
+```
 
 **SQL guard** (`core/sql_guard.py`, checks in this sequence)
 
@@ -681,6 +1108,14 @@ PostgreSQL:
 2. Create and fill the catalogue with the owner account: `gadgetgenie seed --postgres "<owner dsn>"`.
 3. Make the read-only role with `deploy/postgres_readonly_role.sql`.
 4. Set `DB_BACKEND=postgres` and set `DB_DSN` to the read-only role.
+
+```mermaid
+flowchart LR
+    I["pip install -e .[postgres]"] --> S["gadgetgenie seed --postgres<br/>owner DSN"]
+    S --> R["Run deploy/postgres_readonly_role.sql<br/>role gadgetgenie_reader"]
+    R --> E["Set DB_BACKEND=postgres,<br/>DB_DSN of the read-only role"]
+    E --> A["gadgetgenie ask or serve"]
+```
 
 MySQL: create the tables and views with an owner account (the seed step has no MySQL loader). Then run `deploy/mysql_readonly_user.sql`, set `DB_BACKEND=mysql` and set `DB_DSN`.
 
